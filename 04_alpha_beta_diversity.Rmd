@@ -1,0 +1,320 @@
+---
+title: "Axenic tadpole microbiome: rarefaction, alpha and beta diversity, taxonomic composition"
+author: "Andrea Barbi"
+output: html_document
+---
+
+Input: `02.phyloseq_output/physeq_atd.rds` (script 03), `Wd.R` (Wd* test, Hamidi et al. 2019).
+Output: tables in `02.phyloseq_output/`, figures in `02.phyloseq_output/graphs/` (600 dpi TIFF + PDF).
+Run from the project folder (relative paths).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+library(phyloseq)
+library(ggplot2)
+library(ggpubr)
+library(ggsci)
+library(vegan)
+library(dplyr)
+library(tidyr)
+library(rstatix)
+library(microbiome)       # BiocManager::install("microbiome")
+library(RVAideMemoire)
+
+theme_set(theme_bw())
+set.seed(1)               # permutation tests below; a different seed changes p-values only marginally
+
+# Sample labels in figures: "at_ID" (consecutive AA1-AA10) or
+# "tadpole_ID" (original animal number, A4 -> AA4). The two schemes differ for AA and AP:
+# e.g. sample Andrea23 is AA3 (at_ID) but AA4 (tadpole_ID). Use ONE scheme in the paper.
+label_scheme <- "at_ID"
+make_label <- function(df) {
+  if (label_scheme == "at_ID") return(as.character(df$at_ID))
+  x <- as.character(df$tadpole_ID)
+  x <- sub("^A(\\d+)$", "AA\\1", x)
+  x <- sub("^X(\\d+)$", "CA\\1", x)
+  sub("^P(\\d+)$", "CP\\1", x)
+}
+
+out_dir <- "./02.phyloseq_output"
+fig_dir <- file.path(out_dir, "graphs")
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+save_fig <- function(p, name, w, h) {
+  ggsave(file.path(fig_dir, paste0(name, ".tiff")), p, width = w, height = h, units = "in",
+         dpi = 600, compression = "lzw")
+  ggsave(file.path(fig_dir, paste0(name, ".pdf")), p, width = w, height = h, units = "in")
+}
+```
+
+## Data and rarefaction
+
+```{r load}
+physeq_raw <- readRDS("./02.phyloseq_output/physeq_atd.rds")
+sort(sample_sums(physeq_raw))                       # reads per sample before rarefaction
+max(sample_sums(physeq_raw)) / min(sample_sums(physeq_raw))   # depth varies >10x: rarefaction is appropriate
+```
+
+Samples with at least 50,000 reads are rarefied to 50,000 reads without replacement; samples below
+that (the axenic AA samples) are kept un-rarefied.
+NB: the original code then keeps only the ASVs shared between the rarefied samples and the low-read
+samples, which also removes ASVs found exclusively in the low-read (AA) samples.
+
+```{r rarefy}
+high_read_samples <- prune_samples(sample_sums(physeq_raw) >= 50000, physeq_raw)
+low_read_samples  <- prune_samples(sample_sums(physeq_raw) <  50000, physeq_raw)
+
+high_rarefied <- rarefy_even_depth(high_read_samples, sample.size = 50000, rngseed = 1,
+                                   replace = FALSE, trimOTUs = TRUE)
+
+common_taxa   <- intersect(taxa_names(high_rarefied), taxa_names(low_read_samples))
+high_rarefied <- prune_taxa(common_taxa, high_rarefied)
+low_read_samples <- prune_taxa(common_taxa, low_read_samples)
+
+AT.samples <- merge_phyloseq(high_rarefied, low_read_samples)    # analysis dataset
+cat("Samples:", nsamples(AT.samples), " ASVs:", ntaxa(AT.samples), "\n")
+```
+
+## Alpha diversity (Chao1 richness and Shannon)
+
+```{r alpha}
+pAlpha <- plot_richness(AT.samples, x = "group", measures = c("Chao1", "Shannon"))
+pAlpha$data$group <- factor(as.character(pAlpha$data$group), levels = c("AA", "AP", "CA", "CP"))
+
+p <- ggplot(pAlpha$data, aes(group, value, color = group, fill = group)) +
+  geom_boxplot(alpha = 0.3, outlier.shape = NA) +
+  geom_jitter(alpha = 0.6, position = position_jitterdodge()) +
+  facet_wrap(. ~ variable, scale = "free") +
+  scale_color_jco() + scale_fill_jco() +
+  xlab("Group") + ylab("Alpha diversity measure") +
+  theme(legend.position = "bottom")
+
+# Kruskal-Wallis per measure, Dunn post hoc test (Holm)
+dunn_all <- pAlpha$data %>% group_by(variable) %>% dunn_test(value ~ group, p.adjust.method = "holm")
+kw_all <- pAlpha$data %>% group_by(variable) %>% kruskal_test(value ~ group) %>%
+  mutate(label = paste0("p = ", format.pval(p, digits = 3)))
+knitr::kable(as.data.frame(dunn_all)[, 1:9], caption = "Dunn post hoc tests (Holm)")
+knitr::kable(as.data.frame(kw_all), caption = "Kruskal-Wallis tests")
+write.csv(as.data.frame(dunn_all), file.path(out_dir, "alpha_dunn_tests.csv"), row.names = FALSE)
+
+# Significance brackets (free y axis, so positions are computed per facet)
+lv <- levels(pAlpha$data$group)
+ranges <- do.call(rbind, lapply(split(pAlpha$data, pAlpha$data$variable), function(d)
+  data.frame(variable = as.character(d$variable[1]), ymax = max(d$value, na.rm = TRUE),
+             yr = diff(range(d$value, na.rm = TRUE)))))
+rownames(ranges) <- NULL
+
+br <- dunn_all %>%
+  mutate(variable = as.character(variable)) %>%
+  filter(p.adj < 0.05) %>%
+  left_join(ranges, by = "variable") %>%
+  mutate(x1 = match(group1, lv), x2 = match(group2, lv), span = x2 - x1) %>%
+  arrange(variable, span, x1) %>%
+  group_by(variable) %>%
+  mutate(y.position = ymax + 0.10 * yr * row_number(), tip = y.position - 0.03 * yr) %>%
+  ungroup()
+
+p_alpha <- p +
+  geom_segment(data = br, aes(x = x1, xend = x2, y = y.position, yend = y.position, color = group1),
+               inherit.aes = FALSE, linewidth = 0.6, show.legend = FALSE) +
+  geom_segment(data = br, aes(x = x1, xend = x1, y = y.position, yend = tip, color = group1),
+               inherit.aes = FALSE, linewidth = 0.6, show.legend = FALSE) +
+  geom_segment(data = br, aes(x = x2, xend = x2, y = y.position, yend = tip, color = group1),
+               inherit.aes = FALSE, linewidth = 0.6, show.legend = FALSE) +
+  geom_text(data = br, aes(x = (x1 + x2) / 2, y = y.position, label = p.adj.signif, color = group1),
+            inherit.aes = FALSE, vjust = 0.1, size = 5, show.legend = FALSE) +
+  geom_text(data = kw_all, aes(x = -Inf, y = Inf, label = label), inherit.aes = FALSE,
+            hjust = -0.05, vjust = 1.5, size = 4, show.legend = FALSE) +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.25)))
+p_alpha
+save_fig(p_alpha, "alpha_diversity", 8, 5)
+```
+
+```{r alpha-tables}
+phylo_alpha <- prune_taxa(taxa_sums(AT.samples) > 0, AT.samples)
+Alpha <- estimate_richness(phylo_alpha, measures = c("Observed", "Chao1", "Shannon"))
+alpha.stats <- cbind(Alpha, sample_data(phylo_alpha))
+
+alpha.summary <- alpha.stats %>% group_by(treatment, group) %>%
+  summarize(Chao1_mean = mean(Chao1, na.rm = TRUE), Chao1_SD = sd(Chao1, na.rm = TRUE),
+            Shannon_mean = mean(Shannon, na.rm = TRUE), Shannon_SD = sd(Shannon, na.rm = TRUE),
+            .groups = "drop")
+knitr::kable(alpha.summary, caption = "Alpha diversity metrics")
+write.csv(alpha.summary, file.path(out_dir, "alpha-metrics_16S.csv"), row.names = FALSE)
+
+# Table 2: read depth and alpha diversity of the AA samples
+depth_raw  <- data.frame(sample = sample_names(physeq_raw), reads_raw = sample_sums(physeq_raw))
+depth_used <- data.frame(sample = sample_names(AT.samples), reads_analysed = sample_sums(AT.samples))
+alpha_ind  <- Alpha
+alpha_ind$sample <- sample_names(phylo_alpha)       # estimate_richness can mangle row names
+alpha_ind$group  <- as.character(sample_data(phylo_alpha)$group)
+
+AA_table <- alpha_ind %>%
+  filter(group == "AA") %>%
+  left_join(depth_raw, by = "sample") %>%
+  left_join(depth_used, by = "sample") %>%
+  select(sample, group, reads_raw, reads_analysed, Observed, Chao1, Shannon) %>%
+  mutate(across(c(Chao1, Shannon), ~ round(.x, 2))) %>%
+  arrange(sample)
+knitr::kable(AA_table, caption = "Read depth and alpha diversity of AA samples")
+write.csv(AA_table, file.path(out_dir, "AA_readdepth_alphadiv.csv"), row.names = FALSE)
+```
+
+## Beta diversity
+
+Distances are computed on compositional (proportion) data.
+
+```{r beta-plots}
+AT.comp <- microbiome::transform(AT.samples, "compositional")
+
+pcoa_plot <- function(method, title) {
+  ord <- ordinate(AT.comp, "PCoA", method)
+  ord$title <- title
+  plot_ordination(AT.comp, ord, color = "group") +
+    scale_color_jco(name = "Group") +
+    geom_point(size = 3, alpha = 0.8) + stat_ellipse(linetype = 2) +
+    facet_grid(. ~ ord$title) + theme(legend.position = "bottom")
+}
+Beta_bray <- pcoa_plot("bray", "Bray-Curtis")
+Beta_wuni <- pcoa_plot("wunifrac", "Weighted Unifrac")
+
+beta_combined <- ggarrange(Beta_bray, Beta_wuni, ncol = 2, common.legend = TRUE, legend = "bottom")
+beta_combined
+save_fig(beta_combined, "beta_diversity_PCoA", 8, 5)
+```
+
+### Bray-Curtis: dispersion, Wd* test, pairwise tests
+
+```{r beta-bray}
+metadata <- as(sample_data(AT.comp), "data.frame")
+BC.dist  <- phyloseq::distance(AT.comp, "bray")
+
+# Homogeneity of multivariate dispersions
+anova(betadisper(BC.dist, metadata$group))
+# Dispersions differ between groups -> PERMANOVA assumptions violated -> Wd* test (Hamidi et al. 2019)
+
+source("Wd.R")
+WdS.test(BC.dist, as.factor(metadata$group), nrep = 999)
+
+# All pairwise Wd* tests, Bonferroni-adjusted
+df <- Tw2.posthoc.tests(BC.dist, as.factor(metadata$group), nrep = 999)
+df <- as.data.frame(df)
+df[] <- lapply(df, unlist)                 # the test returns list columns
+df$p.value <- as.numeric(df$p.value)
+df$p.adj.bonferroni <- p.adjust(df$p.value, method = "bonferroni")
+df
+write.csv(df, file.path(out_dir, "beta_bray_pairwise_Wd.csv"), row.names = FALSE)
+```
+
+### Weighted UniFrac: dispersion, PERMANOVA, pairwise tests
+
+```{r beta-wunifrac}
+WU.dist <- phyloseq::distance(AT.comp, method = "wunifrac")
+anova(betadisper(WU.dist, metadata$group))     # not significant -> PERMANOVA is valid
+adonis2(WU.dist ~ group, data = metadata)
+
+permtst.wu <- pairwise.perm.manova(WU.dist, metadata$group, p.method = "none", nperm = 9999)
+df.wu <- reshape2::melt(permtst.wu$p.value)
+df.wu <- df.wu[!is.na(df.wu$value), ]
+df.wu$p.adj.bonferroni <- p.adjust(df.wu$value, method = "bonferroni")
+df.wu
+write.csv(df.wu, file.path(out_dir, "beta_wunifrac_pairwise_permanova.csv"), row.names = FALSE)
+```
+
+## Taxonomic composition
+
+```{r phylum-table}
+# Mean +/- SD relative abundance per group (phylum level)
+AT.Phyl    <- tax_glom(AT.samples, "Phylum")
+AT.PhylRel <- transform_sample_counts(AT.Phyl, function(x) 100 * x / sum(x))
+Phyl_tab   <- psmelt(AT.PhylRel) %>% group_by(Phylum, group) %>%
+  summarize(Phyl_mean = mean(Abundance, na.rm = TRUE), Phyl_SD = sd(Abundance, na.rm = TRUE),
+            .groups = "drop")
+knitr::kable(Phyl_tab, caption = "Phylum relative abundance (%)")
+write.csv(Phyl_tab, file.path(out_dir, "AT_phylum_relAb.csv"), row.names = FALSE)
+
+# Same at genus level
+AT.Genus    <- tax_glom(AT.samples, "Genus")
+AT.GenusRel <- transform_sample_counts(AT.Genus, function(x) 100 * x / sum(x))
+Genus_tab   <- psmelt(AT.GenusRel) %>% group_by(Genus, group) %>%
+  summarize(Genus_mean = mean(Abundance, na.rm = TRUE), Genus_SD = sd(Abundance, na.rm = TRUE),
+            .groups = "drop")
+write.csv(Genus_tab, file.path(out_dir, "AT_Genus_relAb.csv"), row.names = FALSE)
+```
+
+```{r phylum-group-plot}
+# Mean relative abundance per group: 7 most abundant phyla, the rest = "Other"
+Phyl_DF <- psmelt(transform_sample_counts(tax_glom(AT.samples, "Phylum", NArm = FALSE),
+                                          function(x) 100 * x / sum(x)))
+Phyl_DF$Phylum <- as.character(Phyl_DF$Phylum)
+Phyl_DF$Phylum[is.na(Phyl_DF$Phylum)] <- "Unassigned"
+
+top_phyla <- names(sort(tapply(Phyl_DF$Abundance, Phyl_DF$Phylum, mean), decreasing = TRUE))[1:7]
+Phyl_DF$Phylum2 <- factor(ifelse(Phyl_DF$Phylum %in% top_phyla, Phyl_DF$Phylum, "Other"),
+                          levels = c(top_phyla, "Other"))
+
+per_sample <- aggregate(Abundance ~ Sample + group + Phylum2, data = Phyl_DF, FUN = sum)
+group_mean <- aggregate(Abundance ~ group + Phylum2, data = per_sample, FUN = mean)
+group_mean$group <- factor(group_mean$group, levels = c("AA", "AP", "CA", "CP"))
+tapply(group_mean$Abundance, group_mean$group, sum)         # sanity check: 100 in every group
+
+phy_cols <- setNames(c(pal_jco()(7), "grey80"), c(top_phyla, "Other"))
+rab <- ggplot(group_mean, aes(x = group, y = Abundance, fill = Phylum2)) +
+  geom_col(width = 0.7) +
+  scale_fill_manual(values = phy_cols, name = "Phylum") +
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE)) +
+  xlab("Group") + ylab("Relative abundance (%)") +
+  theme(axis.line = element_line(color = "black"), text = element_text(size = 14),
+        axis.title = element_text(face = "bold"), legend.position = "bottom",
+        legend.title = element_blank())
+rab
+save_fig(rab, "Phylum_relative_abundance", 7, 7)
+```
+
+```{r aa-absolute-load}
+# Absolute bacterial DNA load (16S copies per tadpole) split by phylum, AA tadpoles only
+AA_DF <- Phyl_DF[Phyl_DF$group == "AA", ]
+AA_DF$label <- make_label(AA_DF)
+summary(AA_DF$bacterial_load)                      # must be copies per tadpole
+
+AA_abs <- aggregate(Abundance ~ label + Phylum2 + bacterial_load, data = AA_DF, FUN = sum)
+AA_abs$CpT_phylum <- AA_abs$Abundance / 100 * AA_abs$bacterial_load
+tot <- tapply(AA_abs$CpT_phylum, AA_abs$label, sum)
+AA_abs$label <- factor(AA_abs$label, levels = names(sort(tot)))       # tadpoles ordered by total load
+
+p_abs <- ggplot(AA_abs, aes(x = label, y = CpT_phylum, fill = Phylum2)) +
+  geom_col(width = 0.8) +
+  scale_fill_manual(values = phy_cols) +
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE)) +
+  xlab("AA tadpoles") + ylab("Bacterial DNA load (copies per tadpole)") +
+  theme(axis.line = element_line(color = "black"), text = element_text(size = 14),
+        axis.title = element_text(face = "bold"), axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom", legend.title = element_blank())
+p_abs
+save_fig(p_abs, "AA_absolute_load_by_phylum", 8, 6)
+```
+
+```{r sample-composition}
+# Composition of every sample (rare phyla merged), labelled with the chosen scheme
+AT.rare <- microbiome::aggregate_rare(AT.samples, level = "Phylum", detection = 95, prevalence = 0.5)
+meta    <- data.frame(sample_data(AT.rare))
+lab_vec <- setNames(make_label(meta), rownames(meta))
+
+prefix <- sub("\\d+$", "", lab_vec)
+number <- as.numeric(sub("^\\D+", "", lab_vec))
+sample_order <- names(lab_vec)[order(prefix, number)]      # AA, AP, CA, CP, then 1, 2, ..., 10
+
+p.phyl <- plot_composition(AT.rare, sample.sort = NULL, otu.sort = NULL, plot.type = "barplot",
+                           verbose = FALSE, group_by = "group") +
+  xlab("Sample") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 7)) +
+  scale_fill_jco() +
+  scale_x_discrete(labels = lab_vec)
+p.phyl$data$Sample <- factor(p.phyl$data$Sample, levels = sample_order)
+p.phyl
+save_fig(p.phyl, "phylum_composition_per_sample", 12, 7)
+```
+
+```{r session}
+sessionInfo()
+```
